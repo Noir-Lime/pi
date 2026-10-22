@@ -898,7 +898,14 @@ describe("durable length recovery", () => {
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
-					pi.on("session_before_compact", () => ({ cancel: true }));
+					pi.on("session_before_compact", (event) => ({
+						compaction: {
+							summary: "summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
 				},
 			],
 		});

@@ -1242,6 +1242,11 @@ export class AgentSession {
 	 * the current run or a resumed session. An unpaired result fails the next request (#11227).
 	 */
 	private _omitRecoveryAttempt(message: AssistantMessage): void {
+		this._applyRecoveryOmission(this._planRecoveryOmission(message));
+	}
+
+	/** Resolve the source entries that a recovery omission of `message` would hide. */
+	private _planRecoveryOmission(message: AssistantMessage): string[] {
 		const toolCallIds = new Set(message.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : [])));
 		// A context edit replaces the projected copy, so match it by source entry as well.
 		const entryId = this._findPersistedMessageEntryId(message);
@@ -1262,8 +1267,11 @@ export class AgentSession {
 		if (unresolvedProjectedTarget) {
 			throw new Error("Cannot persist recovery omission because a projected message has no source entry");
 		}
+		return targetIds.filter((targetId): targetId is string => targetId !== undefined);
+	}
+
+	private _applyRecoveryOmission(targetIds: string[]): void {
 		for (const targetId of targetIds) {
-			if (!targetId) continue;
 			const editId = this.sessionManager.appendContextEdit(targetId, null);
 			const entry = this.sessionManager.getEntry(editId);
 			if (entry) this._emit({ type: "entry_appended", entry });
@@ -3098,10 +3106,16 @@ export class AgentSession {
 				return false;
 			}
 
-			// Persistently omit the selected final attempt before post-run recovery compaction.
-			this._overflowRecoveryAttempted = true;
-			this._omitRecoveryAttempt(assistantMessage);
-			const retry = await this._runAutoCompaction("overflow", willRetry);
+			// Persistently omit the selected final attempt before post-run recovery compaction, but only
+			// once compaction is accepted. An extension that cancels must not spend the retry budget.
+			const omittedTargetIds = this._planRecoveryOmission(assistantMessage);
+			const retry = await this._runAutoCompaction("overflow", willRetry, {
+				omittedTargetIds,
+				commit: () => {
+					this._overflowRecoveryAttempted = true;
+					this._applyRecoveryOmission(omittedTargetIds);
+				},
+			});
 			if (retry) this._failedResponse = assistantMessage;
 			return retry;
 		}
@@ -3154,7 +3168,11 @@ export class AgentSession {
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		recovery?: { omittedTargetIds: string[]; commit: () => void },
+	): Promise<boolean> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		let abortController: AbortController | undefined;
@@ -3167,9 +3185,24 @@ export class AgentSession {
 				return false;
 			}
 
+			// Prepare from the branch as it will be once the recovery omission is committed, so the
+			// extension hook sees the final context. Nothing is persisted until the hook accepts.
 			const pathEntries = this.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, settings);
+			const previewEntries: SessionEntry[] = [...pathEntries];
+			for (const targetId of recovery?.omittedTargetIds ?? []) {
+				previewEntries.push({
+					type: "context_edit",
+					id: `recovery-preview-${previewEntries.length}`,
+					parentId: previewEntries.at(-1)?.id ?? null,
+					timestamp: new Date().toISOString(),
+					targetId,
+					replacement: null,
+				});
+			}
+			const preparation = prepareCompaction(previewEntries, settings);
 			if (!preparation) {
+				// Nothing to compact, so no extension can veto: still omit the failed attempt.
+				recovery?.commit();
 				return false;
 			}
 
@@ -3185,7 +3218,7 @@ export class AgentSession {
 				const extensionResult = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
-					branchEntries: pathEntries,
+					branchEntries: previewEntries,
 					customInstructions: undefined,
 					reason,
 					willRetry,
@@ -3203,6 +3236,8 @@ export class AgentSession {
 				}
 			}
 			abortController.signal.throwIfAborted();
+
+			recovery?.commit();
 
 			let summary: string;
 			let firstKeptEntryId: string;

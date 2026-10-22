@@ -17,7 +17,11 @@ import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
-	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
+	_runAutoCompaction: (
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		recovery?: { omittedTargetIds: string[]; commit: () => void },
+	) => Promise<boolean>;
 };
 
 function createUsage(totalTokens: number) {
@@ -715,7 +719,12 @@ describe("AgentSession compaction characterization", () => {
 			totalTokens: 100,
 			timestamp: Date.now(),
 		});
-		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+		const runAutoCompactionSpy = vi
+			.spyOn(sessionInternals, "_runAutoCompaction")
+			.mockImplementation(async (_reason, _willRetry, recovery) => {
+				recovery?.commit();
+				return false;
+			});
 		const compactionErrors: string[] = [];
 		harness.session.subscribe((event) => {
 			if (event.type === "compaction_end" && event.errorMessage) {
@@ -811,7 +820,12 @@ describe("AgentSession compaction characterization", () => {
 			errorMessage: "prompt is too long",
 			timestamp: Date.now(),
 		});
-		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
+		const runAutoCompactionSpy = vi
+			.spyOn(sessionInternals, "_runAutoCompaction")
+			.mockImplementation(async (_reason, _willRetry, recovery) => {
+				recovery?.commit();
+				return false;
+			});
 		const compactionErrors: string[] = [];
 		harness.session.subscribe((event) => {
 			if (event.type === "compaction_end" && event.errorMessage) {
