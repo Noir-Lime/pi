@@ -41,7 +41,12 @@ import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
-import { parseJsonWithRepair, parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
+import {
+	parseJsonWithRepair,
+	parseStreamingJson,
+	parseToolCallArguments,
+	STREAMING_PARSE_EAGER_LIMIT,
+} from "../utils/json-parse.ts";
 import {
 	applyOpenRouterReportedCost,
 	isOpenRouterModel,
@@ -695,7 +700,13 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
+			type Block = (
+				| ThinkingContent
+				| TextContent
+				| (ToolCall & { partialJson: string; lastParsedSize?: number })
+			) & {
+				index: number;
+			};
 			const blocks = output.content as Block[];
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
@@ -802,7 +813,17 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						const block = blocks[index];
 						if (block && block.type === "toolCall") {
 							block.partialJson += event.delta.partial_json;
-							block.arguments = parseStreamingJson(block.partialJson);
+							// Re-parsing the whole buffer on every delta is quadratic for large tool calls.
+							// Parse every delta while small, then only when the buffer has doubled.
+							// content_block_stop does the authoritative parse.
+							const size = block.partialJson.length;
+							if (
+								size <= STREAMING_PARSE_EAGER_LIMIT ||
+								size >= (block.lastParsedSize ?? STREAMING_PARSE_EAGER_LIMIT) * 2
+							) {
+								block.arguments = parseStreamingJson(block.partialJson);
+								block.lastParsedSize = size;
+							}
 							stream.push({
 								type: "toolcall_delta",
 								contentIndex: index,
@@ -842,6 +863,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							// Finalize in-place and strip the scratch buffer so replay only
 							// carries parsed arguments.
 							delete (block as { partialJson?: string }).partialJson;
+							delete block.lastParsedSize;
 							stream.push({
 								type: "toolcall_end",
 								contentIndex: index,
@@ -935,6 +957,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { index?: number }).index;
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as { partialJson?: string }).partialJson;
+				delete (block as { lastParsedSize?: number }).lastParsedSize;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);

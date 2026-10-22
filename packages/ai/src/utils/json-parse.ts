@@ -126,6 +126,12 @@ export function parseToolCallArguments(json: string | undefined): Pick<ToolCall,
  * @param partialJson The partial JSON string from streaming
  * @returns Parsed object or empty object if parsing fails
  */
+/**
+ * Tool-call buffers up to this many characters are re-parsed on every delta. Larger buffers are
+ * re-parsed only after they double, because parsing the whole buffer per delta is quadratic.
+ */
+export const STREAMING_PARSE_EAGER_LIMIT = 32768;
+
 export function parseStreamingJson<T = Record<string, unknown>>(partialJson: string | undefined): T {
 	if (!partialJson || partialJson.trim() === "") {
 		return {} as T;

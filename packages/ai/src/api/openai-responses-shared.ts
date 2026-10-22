@@ -33,7 +33,7 @@ import type {
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
+import { parseStreamingJson, parseToolCallArguments, STREAMING_PARSE_EAGER_LIMIT } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import { resolveTranscript, resolveTranscriptTools, type TranscriptToolSupport } from "../utils/transcript.ts";
@@ -480,6 +480,7 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 
 type StreamingToolCall = ToolCall & {
 	partialJson?: string;
+	lastParsedSize?: number;
 	customInput?: {
 		property: string;
 		jsonBuffer: GrammarToolInputJsonBuffer;
@@ -734,7 +735,16 @@ export async function processResponsesStream<TApi extends Api>(
 			const slot = getSlot(event.output_index, "toolCall");
 			if (!slot || slot.block.partialJson === undefined) continue;
 			slot.block.partialJson += event.delta;
-			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+			// Parse every delta while small, then only when the buffer has doubled. The parse at
+			// output_item.done is authoritative.
+			const size = slot.block.partialJson.length;
+			if (
+				size <= STREAMING_PARSE_EAGER_LIMIT ||
+				size >= (slot.block.lastParsedSize ?? STREAMING_PARSE_EAGER_LIMIT) * 2
+			) {
+				slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+				slot.block.lastParsedSize = size;
+			}
 			pushToolCallDelta(slot, event.delta);
 		} else if (event.type === "response.function_call_arguments.done") {
 			const slot = getSlot(event.output_index, "toolCall");
@@ -796,6 +806,7 @@ export async function processResponsesStream<TApi extends Api>(
 				// Finalize in-place and strip the scratch buffer so replay only
 				// carries parsed arguments.
 				delete slot.block.partialJson;
+				delete slot.block.lastParsedSize;
 				stream.push({
 					type: "toolcall_end",
 					contentIndex: slot.contentIndex,
