@@ -18,7 +18,11 @@ const MIN_MAX_TOKENS = 1;
 export function clampMaxTokensToContext(model: Model<Api>, context: TranscriptContext, maxTokens: number): number {
 	if (model.contextWindow <= 0) return Math.max(MIN_MAX_TOKENS, maxTokens);
 	const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;
-	return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));
+	// The estimate is a guess (stale usage, edited or rewritten context). When it says there is no room at
+	// all, clamping to MIN_MAX_TOKENS dispatches a request that can only return one token with
+	// stopReason "length". The provider rejects a real overflow itself, so keep the requested ceiling.
+	if (available <= 0) return Math.max(MIN_MAX_TOKENS, maxTokens);
+	return Math.min(maxTokens, available);
 }
 
 export function resolveSamplingParams(
